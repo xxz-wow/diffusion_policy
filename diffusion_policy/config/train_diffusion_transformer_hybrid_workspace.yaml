@@ -45,6 +45,7 @@ policy:
   use_musa_graph: False
   # Benchmark and check eligible FP32 encoder convolutions on first use.
   use_musa_conv_backward: False
+  use_musa_conv_weight_grad: False
   n_layer: 8
   n_cond_layers: 0  # >0: use transformer encoder for cond, otherwise use MLP
   n_head: 4
