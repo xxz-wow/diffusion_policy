@@ -46,6 +46,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             obs_as_cond=True,
             pred_action_steps_only=False,
             use_musa_graph=False,
+            use_musa_conv_backward=False,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -135,6 +136,10 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                     pos_enc=x.pos_enc
                 )
             )
+
+        if use_musa_conv_backward:
+            from diffusion_policy.model.vision.musa_conv_backward import enable_musa_conv_backward
+            enable_musa_conv_backward(obs_encoder)
 
         # create diffusion model
         obs_feature_dim = obs_encoder.output_shape()[0]
