@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Dict, Tuple
 import math
 import torch
@@ -14,6 +15,7 @@ from diffusion_policy.common.robomimic_config_util import get_robomimic_config
 from robomimic.algo import algo_factory
 from robomimic.algo.algo import PolicyAlgo
 import robomimic.utils.obs_utils as ObsUtils
+import robomimic.utils.tensor_utils as TensorUtils
 import robomimic.models.base_nets as rmbn
 import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
@@ -158,6 +160,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             use_musa_graph=use_musa_graph
         )
 
+        self._camera_stream = None
         self.obs_encoder = obs_encoder
         self.model = model
         self.noise_scheduler = noise_scheduler
@@ -313,6 +316,50 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         )
         return optimizer
 
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["_camera_stream"] = None
+        return state
+
+    def _encode_training_obs(self, obs):
+        encoder = self.obs_encoder
+        camera = "agentview_image"
+        if (not self.model.use_musa_graph or not encoder.training or not torch.is_grad_enabled()
+                or camera not in obs or obs[camera].device.type != "musa"
+                or "robot0_eye_in_hand_image" not in obs or any(encoder.obs_share_mods.values())):
+            return encoder(obs)
+
+        device = obs[camera].device
+        parent = torch.musa.current_stream(device)
+        side = getattr(self, "_camera_stream", None)
+        if side is None or side.device != device:
+            side = self._camera_stream = torch.musa.Stream(device=device)
+
+        # Schedule one independent camera on a second stream. Keep the encoder's
+        # modality order so random draws and the concatenated features stay aligned.
+        side.wait_stream(parent)
+        obs[camera].record_stream(side)
+        features = []
+        for key in encoder.obs_shapes:
+            with torch.musa.stream(side) if key == camera else nullcontext():
+                x = obs[key]
+                randomizer = encoder.obs_randomizers[key]
+                net = encoder.obs_nets[key]
+                if randomizer is not None:
+                    x = randomizer.forward_in(x)
+                if net is not None:
+                    x = net(x)
+                    if encoder.activation is not None:
+                        x = encoder.activation(x)
+                if randomizer is not None:
+                    x = randomizer.forward_out(x)
+                x = TensorUtils.flatten(x, begin_axis=1)
+                if key == camera:
+                    x.record_stream(parent)
+                features.append(x)
+        parent.wait_stream(side)
+        return torch.cat(features, dim=-1)
+
     def compute_loss(self, batch, *, replay_masks=None):
         # normalize input
         assert 'valid_mask' not in batch
@@ -329,7 +376,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
                 lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            nobs_features = self._encode_training_obs(this_nobs)
             # reshape back to B, T, Do
             cond = nobs_features.reshape(batch_size, To, -1)
             if self.pred_action_steps_only:
@@ -339,7 +386,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         else:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            nobs_features = self._encode_training_obs(this_nobs)
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
             trajectory = torch.cat([nactions, nobs_features], dim=-1).detach()
