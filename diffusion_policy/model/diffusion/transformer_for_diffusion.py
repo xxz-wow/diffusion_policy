@@ -22,9 +22,13 @@ class TransformerForDiffusion(ModuleAttrMixin):
             causal_attn: bool=False,
             time_as_cond: bool=True,
             obs_as_cond: bool=False,
-            n_cond_layers: int = 0
+            n_cond_layers: int = 0,
+            use_musa_graph: bool = False
         ) -> None:
         super().__init__()
+
+        self.use_musa_graph = use_musa_graph
+        self._musa_graph_cache = None
 
         # compute number of tokens for main trunk and condition encoder
         if n_obs_steps is None:
@@ -267,16 +271,48 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         return optimizer
 
+    def _apply(self, *args, **kwargs):
+        # Graph replay binds the parameter/buffer addresses at capture time.
+        self._musa_graph_cache = None
+        return super()._apply(*args, **kwargs)
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["_musa_graph_cache"] = None
+        return state
+
     def forward(self, 
         sample: torch.Tensor, 
         timestep: Union[torch.Tensor, float, int], 
-        cond: Optional[torch.Tensor]=None, **kwargs):
+        cond: Optional[torch.Tensor]=None, replay_masks=None, **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         cond: (B,T',cond_dim)
         output: (B,T,input_dim)
         """
+        if (self.use_musa_graph and self.training and torch.is_grad_enabled()
+                and sample.device.type == "musa" and self.decoder is not None
+                and torch.is_tensor(timestep) and cond is not None
+                and not torch.is_autocast_enabled("musa")):
+            # The optional last input supplies this step's masks for fixed-input tests.
+            args = (sample, timestep, cond)
+            if replay_masks is not None:
+                args += (replay_masks.values,)
+            signature = tuple((x.shape, x.stride(), x.device, x.dtype, x.requires_grad)
+                              for x in args)
+            if self._musa_graph_cache is None:
+                body = _MusaTrainingBody(self, replay_masks)
+                examples = tuple(x.detach().clone().requires_grad_(x.requires_grad) for x in args)
+                torch.musa.make_graphed_callables(body, examples, allow_unused_input=True)
+                # Keep the transient capture outside the module tree and state_dict.
+                self._musa_graph_cache = (signature, replay_masks, body)
+            captured, masks, body = self._musa_graph_cache
+            if captured == signature and masks is replay_masks:
+                return body(*args)
+        return self._forward_impl(sample, timestep, cond)
+
+    def _forward_impl(self, sample, timestep, cond, decoder_kwargs=None):
         # 1. time
         timesteps = timestep
         if not torch.is_tensor(timesteps):
@@ -333,7 +369,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 tgt=x,
                 memory=memory,
                 tgt_mask=self.mask,
-                memory_mask=self.memory_mask
+                memory_mask=self.memory_mask,
+                **(decoder_kwargs or {})
             )
             # (B,T,n_emb)
         
@@ -342,6 +379,23 @@ class TransformerForDiffusion(ModuleAttrMixin):
         x = self.head(x)
         # (B,T,n_out)
         return x
+
+
+class _MusaTrainingBody(nn.Module):
+    def __init__(self, model, replay_masks):
+        super().__init__()
+        from torch.nn.modules.transformer import _detect_is_causal_mask
+
+        self.model = model
+        self.replay_masks = replay_masks
+        # Inspect the fixed attention mask before capture, avoiding a device sync inside it.
+        self.decoder_kwargs = {"tgt_is_causal": _detect_is_causal_mask(model.mask, None)}
+
+    def forward(self, sample, timestep, cond, mask_values=None):
+        if self.replay_masks is None:
+            return self.model._forward_impl(sample, timestep, cond, self.decoder_kwargs)
+        with self.replay_masks.use(mask_values):
+            return self.model._forward_impl(sample, timestep, cond, self.decoder_kwargs)
 
 
 def test():

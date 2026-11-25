@@ -42,6 +42,7 @@ policy:
   obs_encoder_group_norm: True
   eval_fixed_crop: True
 
+  use_musa_graph: False
   n_layer: 8
   n_cond_layers: 0  # >0: use transformer encoder for cond, otherwise use MLP
   n_head: 4

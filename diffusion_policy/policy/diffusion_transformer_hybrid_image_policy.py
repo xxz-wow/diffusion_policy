@@ -43,6 +43,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             time_as_cond=True,
             obs_as_cond=True,
             pred_action_steps_only=False,
+            use_musa_graph=False,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -153,7 +154,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             causal_attn=causal_attn,
             time_as_cond=time_as_cond,
             obs_as_cond=obs_as_cond,
-            n_cond_layers=n_cond_layers
+            n_cond_layers=n_cond_layers,
+            use_musa_graph=use_musa_graph
         )
 
         self.obs_encoder = obs_encoder
@@ -311,7 +313,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         )
         return optimizer
 
-    def compute_loss(self, batch):
+    def compute_loss(self, batch, *, replay_masks=None):
         # normalize input
         assert 'valid_mask' not in batch
         nobs = self.normalizer.normalize(batch['obs'])
@@ -368,7 +370,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
         
         # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, cond)
+        pred = self.model(noisy_trajectory, timesteps, cond, replay_masks=replay_masks)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
