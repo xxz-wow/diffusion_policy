@@ -98,6 +98,7 @@ training:
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
   use_ema: True
+  batched_ema: False  # Optional FP32 MUSA update
   # training loop control
   # in epochs
   rollout_every: 50

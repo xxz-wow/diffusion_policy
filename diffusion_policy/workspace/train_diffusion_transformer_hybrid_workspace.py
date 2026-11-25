@@ -26,7 +26,7 @@ from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
-from diffusion_policy.model.diffusion.ema_model import EMAModel
+from diffusion_policy.model.diffusion.ema_model import BatchedEMAUpdate, EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
@@ -133,6 +133,12 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
+
+        batched_ema = None
+        if ema is not None and cfg.training.get("batched_ema", False):
+            if device.type != "musa":
+                raise ValueError("training.batched_ema requires a MUSA device")
+            batched_ema = BatchedEMAUpdate(ema, self.model)
         
         # save batch for sampling
         train_sampling_batch = None
@@ -173,7 +179,9 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                             lr_scheduler.step()
                         
                         # update ema
-                        if cfg.training.use_ema:
+                        if batched_ema is not None:
+                            batched_ema()
+                        elif ema is not None:
                             ema.step(self.model)
 
                         # logging

@@ -86,3 +86,39 @@ class EMAModel:
         # verify that iterating over module and then parameters is identical to parameters recursively.
         # assert old_all_dataptrs == all_dataptrs
         self.optimization_step += 1
+
+
+class BatchedEMAUpdate:
+    """Cache FP32 parameter pairs for a fixed model after device placement."""
+
+    def __init__(self, ema, policy):
+        self.ema = ema
+        self.copy_pairs = []
+        self.sources = []
+        self.targets = []
+        seen = set()
+        for src_module, dst_module in zip(policy.modules(), ema.averaged_model.modules()):
+            for src, dst in zip(src_module.parameters(recurse=False), dst_module.parameters(recurse=False)):
+                if dst.numel():
+                    ptr = dst.untyped_storage().data_ptr()
+                    if ptr in seen:
+                        raise ValueError("Batched EMA requires independent target storage")
+                    seen.add(ptr)
+                if not src.requires_grad or isinstance(src_module, _BatchNorm):
+                    self.copy_pairs.append((dst, src))
+                    continue
+                if src.dtype != torch.float32 or dst.dtype != src.dtype or src.device != dst.device:
+                    raise ValueError("Batched EMA requires matching FP32 source and target parameters")
+                self.targets.append(dst.detach())
+                self.sources.append(src.detach())
+
+    @torch.no_grad()
+    def __call__(self):
+        ema = self.ema
+        ema.decay = ema.get_decay(ema.optimization_step)
+        for dst, src in self.copy_pairs:
+            dst.copy_(src.to(dtype=dst.dtype))
+        if self.targets:
+            torch._foreach_mul_(self.targets, ema.decay)
+            torch._foreach_add_(self.targets, self.sources, alpha=1 - ema.decay)
+        ema.optimization_step += 1
