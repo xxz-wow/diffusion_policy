@@ -7,6 +7,45 @@ from diffusion_policy.model.common.module_attr_mixin import ModuleAttrMixin
 
 logger = logging.getLogger(__name__)
 
+
+def _needs_explicit_attention(attn, x):
+    # This torch_musa build uses post-dropout weights in the FP32 softmax backward.
+    return (x.device.type == "musa" and torch.__version__ == "2.11.0.post1+musa5.2.0"
+            and x.dtype == torch.float32 and attn.training and attn.dropout > 0
+            and torch.is_grad_enabled() and not torch.is_autocast_enabled("musa"))
+
+
+def _explicit_attention(attn, query, memory, attn_mask, key_padding_mask, is_causal=False):
+    # Requesting per-head weights selects PyTorch's matmul/softmax/dropout path.
+    # The Transformer only consumes the projected output.
+    output, _ = attn(query, memory, memory, attn_mask=attn_mask,
+                     key_padding_mask=key_padding_mask, is_causal=is_causal,
+                     need_weights=True, average_attn_weights=False)
+    return output
+
+
+class _MusaSelfAttention:
+    def _sa_block(self, x, attn_mask, key_padding_mask, *args, **kwargs):
+        if _needs_explicit_attention(self.self_attn, x):
+            output = _explicit_attention(self.self_attn, x, x, attn_mask, key_padding_mask,
+                                         *args, **kwargs)
+            return self.dropout1(output)
+        return super()._sa_block(x, attn_mask, key_padding_mask, *args, **kwargs)
+
+
+class _EncoderLayer(_MusaSelfAttention, nn.TransformerEncoderLayer):
+    pass
+
+
+class _DecoderLayer(_MusaSelfAttention, nn.TransformerDecoderLayer):
+    def _mha_block(self, x, mem, attn_mask, key_padding_mask, *args, **kwargs):
+        if _needs_explicit_attention(self.multihead_attn, x):
+            output = _explicit_attention(self.multihead_attn, x, mem, attn_mask,
+                                         key_padding_mask, *args, **kwargs)
+            return self.dropout2(output)
+        return super()._mha_block(x, mem, attn_mask, key_padding_mask, *args, **kwargs)
+
+
 class TransformerForDiffusion(ModuleAttrMixin):
     def __init__(self,
             input_dim: int,
@@ -63,7 +102,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         if T_cond > 0:
             self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
             if n_cond_layers > 0:
-                encoder_layer = nn.TransformerEncoderLayer(
+                encoder_layer = _EncoderLayer(
                     d_model=n_emb,
                     nhead=n_head,
                     dim_feedforward=4*n_emb,
@@ -83,7 +122,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
                     nn.Linear(4 * n_emb, n_emb)
                 )
             # decoder
-            decoder_layer = nn.TransformerDecoderLayer(
+            decoder_layer = _DecoderLayer(
                 d_model=n_emb,
                 nhead=n_head,
                 dim_feedforward=4*n_emb,
@@ -100,7 +139,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
             # encoder only BERT
             encoder_only = True
 
-            encoder_layer = nn.TransformerEncoderLayer(
+            encoder_layer = _EncoderLayer(
                 d_model=n_emb,
                 nhead=n_head,
                 dim_feedforward=4*n_emb,
